@@ -64,6 +64,7 @@ class MediaInfo:
     extradata: bytes
     audio: tuple[AudioInfo, ...]
     file_identity: tuple[int, int]
+    timecode: str | None
 
 
 @dataclass(frozen=True)
@@ -92,9 +93,17 @@ def inspect_media(path: Path | str, cancel: threading.Event | None = None,
             videos = list(container.streams.video)
             if len(videos) != 1:
                 raise MediaError("目前只支持包含一个视频轨道的文件。")
-            if any(s.type not in {"video", "audio"} for s in container.streams) or container.chapters():
-                raise MediaError("此文件含字幕、章节或数据轨道；为避免丢失信息，暂不处理。")
             stream = videos[0]
+            # The MOV demuxer exposes tmcd tracks as data with a timecode tag
+            # and no decoder. They are regenerated at the conformed frame rate.
+            extras = [s for s in container.streams if s.type not in {"video", "audio"}]
+            timecode = stream.metadata.get("timecode")
+            if (container.chapters() or any(
+                    path.suffix.lower() not in {".mov", ".mp4", ".m4v"}
+                    or s.type != "data" or s.codec_context is not None
+                    or not timecode or s.metadata.get("timecode") != timecode
+                    for s in extras) or len(extras) > 1):
+                raise MediaError("此文件含暂不支持的字幕、章节或数据轨道；标准 MOV 时间码轨道可以处理。")
             rate = stream.average_rate or stream.guessed_rate or stream.base_rate
             if rate is None or rate <= 0:
                 raise MediaError("无法确定原始帧率。")
@@ -192,7 +201,8 @@ def inspect_media(path: Path | str, cancel: threading.Event | None = None,
             if _identity(path) != identity:
                 raise MediaError("检查期间源文件发生变化，请重新添加。")
             return MediaInfo(path, rate, count, actual_duration, first, tb, stream.index, ctx.name,
-                             ctx.width, ctx.height, properties, digest.hexdigest(), extradata, audio, identity)
+                             ctx.width, ctx.height, properties, digest.hexdigest(), extradata, audio, identity,
+                             timecode if extras else None)
     except (MediaError, Cancelled):
         raise
     except (av.FFmpegError, OSError, ValueError) as error:
@@ -264,6 +274,56 @@ def _publish(temp: Path, source: Path, target: Fraction, directory: Path) -> Pat
     raise MediaError("同名输出文件过多，请选择其他文件夹。")
 
 
+def _video_time_base(target: Fraction, suffix: str) -> Fraction:
+    if suffix.lower() == ".avi":
+        # AVI stores a frame clock in its stream header.
+        return 1 / target
+    return Fraction(1, target.numerator * min(512, 2_000_000_000 // target.numerator))
+
+
+def _retime_video(info: MediaInfo, target: Fraction, destination: Path,
+                  cancel: threading.Event | None, progress: Callable[[float], None]):
+    """Remux packets on an exact frame grid, before any muxer quantization.
+
+    The inspection has already proven CFR. Rational source-frame positions
+    avoid accumulating millisecond rounding in MKV/WebM or rounding away
+    timestamps from v1.0.0's one-tick-per-frame MP4/MOV exports.
+    """
+    tb = _video_time_base(target, info.path.suffix)
+    try:
+        with av.open(str(info.path)) as source, av.open(str(destination), "w") as output:
+            original = source.streams[info.video_index]
+            video = output.add_stream_from_template(original)
+            video.metadata.update(original.metadata)
+            output.metadata.update(source.metadata)
+            output.metadata.pop("DURATION", None)
+            video.metadata.pop("DURATION", None)
+            video.time_base = tb
+            video.codec_context.framerate = target
+            if original.sample_aspect_ratio is not None:
+                video.codec_context.sample_aspect_ratio = original.sample_aspect_ratio
+            output.start_encoding()
+            count = 0
+            for packet in source.demux(original):
+                check_cancel(cancel)
+                if not packet.size:
+                    continue
+                pts_frame = round((packet.pts * packet.time_base - info.start) * info.fps)
+                dts_frame = (round((packet.dts * packet.time_base - info.start) * info.fps)
+                             if packet.dts is not None else None)
+                packet.pts = round(pts_frame / target / tb)
+                packet.dts = round(dts_frame / target / tb) if dts_frame is not None else None
+                packet.duration = round(1 / target / tb)
+                packet.time_base = tb
+                packet.stream = video
+                output.mux(packet)
+                count += 1
+                if count % 48 == 0:
+                    progress(min(1., count / info.frame_count))
+    except av.FFmpegError as error:
+        raise MediaError(f"无法在原格式内调整时间信息：{error}") from error
+
+
 def convert(source: Path | str, target: Fraction, directory: Path | str,
             cancel: threading.Event | None = None, progress: Progress | None = None) -> ConversionResult:
     target = parse_fps(str(target))
@@ -279,6 +339,7 @@ def convert(source: Path | str, target: Fraction, directory: Path | str,
     fd, name = tempfile.mkstemp(prefix=".fps-tools-", suffix=source.suffix, dir=directory)
     os.close(fd)
     temp = Path(name)
+    video_temp = None
     try:
         report("正在导出", .3)
         check_cancel(cancel)
@@ -288,20 +349,25 @@ def convert(source: Path | str, target: Fraction, directory: Path | str,
                     check_cancel(cancel)
                     dst.write(chunk)
         else:
-            # Scale before the muxer's target-rate time-base quantization. setts
-            # must preserve PTS and DTS separately, or B-frame order is corrupted.
-            expr = f"setts=pts=PTS:dts=DTS:duration=1/(({target})*TB)"
-            cmd = ["-y", "-err_detect", "explode", "-copyts", "-itsoffset", str(-float(info.start)),
-                   "-itsscale:v", str(float(info.fps/target)), "-i", str(source),
-                   "-map", f"0:{info.video_index}"]
-            for audio in info.audio:
-                cmd += ["-map", f"0:{audio.index}"]
-            cmd += ["-map_metadata", "0", "-map_chapters", "-1", "-c:v", "copy", "-bsf:v", expr,
-                    "-r:v", str(target), "-avoid_negative_ts", "disabled", *args]
-            if source.suffix.lower() in {".mp4", ".mov", ".m4v"}:
-                cmd += ["-video_track_timescale", str(target.numerator)]
-            cmd += [str(temp)]
-            run_engine(cmd, cancel, lambda v: report("正在导出", .3 + v*.35), float(duration))
+            if info.audio:
+                fd, name = tempfile.mkstemp(prefix=".fps-tools-video-", suffix=source.suffix, dir=directory)
+                os.close(fd)
+                video_temp = Path(name)
+            _retime_video(info, target, video_temp or temp, cancel,
+                          lambda v: report("调整画面时间", .3 + v*.15))
+            if info.audio:
+                # The video clock is already correct. FFmpeg only copies it and
+                # processes audio from the original file; no input time scaling.
+                cmd = ["-y", "-err_detect", "explode", "-copyts", "-i", str(video_temp),
+                       "-i", str(source), "-map", "0:v:0"]
+                for audio in info.audio:
+                    cmd += ["-map", f"1:{audio.index}"]
+                cmd += ["-map_metadata", "1", "-map_metadata:s:v:0", "0:s:v:0", "-map_chapters", "-1",
+                        "-c:v", "copy", "-r:v", str(target), "-avoid_negative_ts", "disabled", *args]
+                if source.suffix.lower() in {".mp4", ".mov", ".m4v"}:
+                    cmd += ["-video_track_timescale", str(_video_time_base(target, source.suffix).denominator)]
+                cmd += [str(temp)]
+                run_engine(cmd, cancel, lambda v: report("同步处理声音", .45 + v*.2), float(duration))
         report("校验画面与帧数", .65)
         checked = inspect_media(temp, cancel, lambda _, v: report("校验画面与帧数", .65 + v*.34))
         if (checked.frame_count != info.frame_count or checked.packet_hash != info.packet_hash
@@ -312,6 +378,8 @@ def convert(source: Path | str, target: Fraction, directory: Path | str,
             raise MediaError("目标帧率或时长校验未通过，输出已撤销。")
         if len(checked.audio) != len(info.audio):
             raise MediaError("音轨完整性校验未通过，输出已撤销。")
+        if checked.timecode != info.timecode:
+            raise MediaError("原时间码无法完整保留到目标帧率，输出已撤销。")
         if _identity(source) != info.file_identity:
             raise MediaError("处理期间源文件发生变化，输出已撤销。")
         check_cancel(cancel)
@@ -322,3 +390,5 @@ def convert(source: Path | str, target: Fraction, directory: Path | str,
         raise MediaError(f"文件读写失败：{error}") from error
     finally:
         temp.unlink(missing_ok=True)
+        if video_temp:
+            video_temp.unlink(missing_ok=True)

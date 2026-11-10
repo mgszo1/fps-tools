@@ -199,3 +199,47 @@ def test_extended_final_frame_is_rejected(make_video, tmp_path, target):
             output.mux(packet)
     with pytest.raises(MediaError):
         convert(extended,Fraction(target),tmp_path)
+
+
+@pytest.mark.parametrize("codec", ["libx264", "libx265"])
+def test_legacy_low_precision_export_can_be_reconverted(make_video, tmp_path, codec):
+    # v1.0.0 wrote exactly one time-base tick per frame. Reproduce that file
+    # independently so this regression remains meaningful after new exports change.
+    src = make_video(fps="12", frames=97, codec=codec, extra=("-video_track_timescale", "12"))
+    assert inspect_media(src).time_base == Fraction(1,12)
+    out = convert(src, Fraction(30), tmp_path)
+    info = inspect_media(out.path)
+    assert info.frame_count == 97
+    assert info.duration == Fraction(97,30)
+    assert packet_hash(out.path) == packet_hash(src)
+
+
+@pytest.mark.parametrize("ext,codec", [("mp4","libx264"), ("mov","prores_ks"),
+    ("mkv","libx264"), ("avi","mpeg4"), ("webm","libvpx-vp9")])
+def test_repeated_conform_keeps_original_frames(make_video, tmp_path, ext, codec):
+    src = make_video(name="chain."+ext,frames=97,audio=False,codec=codec)
+    original_hash = packet_hash(src)
+    for target in [Fraction(12), Fraction(30), Fraction(24000,1001), Fraction(60), Fraction(24)]:
+        result = convert(src,target,tmp_path)
+        info = inspect_media(result.path)
+        assert info.frame_count == 97
+        assert info.fps == target
+        assert float(info.duration) == pytest.approx(float(97/target),abs=.002)
+        assert packet_hash(result.path) == original_hash
+        src = result.path
+
+
+@pytest.mark.parametrize("codec", ["libx264", "prores_ks"])
+def test_mov_timecode_survives_repeated_conform(make_video, tmp_path, codec):
+    src = make_video(name="带时间码.mov",frames=97,codec=codec,extra=("-timecode","01:02:03:04"))
+    original_hash = packet_hash(src)
+    for target in [Fraction(12), Fraction(30)]:
+        out = convert(src,target,tmp_path)
+        assert inspect_media(out.path).frame_count == 97
+        assert packet_hash(out.path) == original_hash
+        with av.open(str(out.path)) as c:
+            timecodes = [s for s in c.streams if s.type == "data"]
+            assert len(timecodes) == 1
+            assert timecodes[0].metadata["timecode"] == "01:02:03:04"
+            assert float(timecodes[0].duration*timecodes[0].time_base) == pytest.approx(float(97/target),abs=.002)
+        src = out.path
