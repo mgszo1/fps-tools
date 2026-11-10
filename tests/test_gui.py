@@ -31,7 +31,9 @@ def settle(app, window):
     deadline = time.monotonic() + 30
     while window.busy and time.monotonic() < deadline:
         app.processEvents()
-        QTest.qWait(20)
+        # qWait can retain the Python GIL on some PySide/Windows builds,
+        # starving the Python QThread worker we are waiting for.
+        time.sleep(.01)
     app.processEvents()
     assert not window.busy
 
