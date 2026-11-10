@@ -127,10 +127,17 @@ def inspect_media(path: Path | str, cancel: threading.Event | None = None,
             tolerance = min(max(tb * Fraction(11,10), Fraction(1,1_000_000)), Fraction(49,100)/rate)
             ends: dict[int, Fraction] = {}
             audio_ends: dict[int, Fraction] = {}
+            timecode_span = None
             for packet in container.demux():
                 check_cancel(cancel)
                 if packet.is_corrupt:
                     raise MediaError("检测到损坏或不完整的数据包，无法保证完整导出。")
+                if packet.size and packet.stream.type == "data":
+                    if (timecode_span is not None or packet.size != 4
+                            or packet.pts is None or not packet.duration):
+                        raise MediaError("此 MOV 包含多段或特殊时间码，暂不能完整保留；未生成输出。")
+                    timecode_span = (packet.pts * packet.time_base,
+                                     (packet.pts + packet.duration) * packet.time_base)
                 if packet.size and packet.pts is not None and packet.duration:
                     end = Fraction(packet.pts + packet.duration) * packet.time_base
                     ends[packet.stream.index] = max(ends.get(packet.stream.index, end), end)
@@ -182,6 +189,11 @@ def inspect_media(path: Path | str, cancel: threading.Event | None = None,
             if actual_end is None or abs(actual_end - first - count/rate) > tolerance:
                 raise MediaError("视频末帧时长异常或无法确认，不属于可完整校验的恒定帧率视频。")
             actual_duration = actual_end - first
+            if extras:
+                tc_tolerance = max(tb, extras[0].time_base)
+                if (timecode_span is None or abs(timecode_span[0]-first) > tc_tolerance
+                        or abs(timecode_span[1]-actual_end) > tc_tolerance):
+                    raise MediaError("MOV 时间码覆盖范围与视频不一致，暂不能完整保留；未生成输出。")
             if stream.duration and abs(stream.duration*tb - actual_duration) > max(2*tb,tolerance):
                 raise MediaError("视频实际时长与索引不一致，文件可能不完整。")
             declared = stream.metadata.get("DURATION", "")

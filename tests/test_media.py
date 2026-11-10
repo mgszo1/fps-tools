@@ -1,4 +1,5 @@
 import hashlib
+import struct
 import subprocess
 import threading
 from fractions import Fraction
@@ -250,3 +251,49 @@ def test_hevc_apple_codec_tag_is_preserved(make_video, tmp_path):
     out = convert(src,Fraction(30),tmp_path)
     with av.open(str(out.path)) as c:
         assert c.streams.video[0].codec_context.codec_tag == "hvc1"
+
+
+@pytest.mark.parametrize("kind", ["multiple", "short"])
+def test_unsupported_timecode_maps_are_not_silently_replaced(make_video, tmp_path, kind):
+    src = make_video(name="timecode.mov",frames=96,audio=False,extra=("-timecode","01:02:03:04"))
+    unusual = tmp_path/f"{kind}.mov"
+    data = bytearray(src.read_bytes())
+    def children(begin, end):
+        while begin < end:
+            size, tag = struct.unpack_from(">I4s",data,begin)
+            assert 8 <= size <= end-begin
+            yield tag, begin, begin+size
+            begin += size
+    def child(begin, end, tag):
+        return next((start,stop) for name,start,stop in children(begin,end) if name == tag)
+    moov, moov_end = child(0,len(data),b"moov")
+    for tag,trak,trak_end in children(moov+8,moov_end):
+        if tag != b"trak":
+            continue
+        mdia,mdia_end = child(trak+8,trak_end,b"mdia")
+        minf,minf_end = child(mdia+8,mdia_end,b"minf")
+        stbl,stbl_end = child(minf+8,minf_end,b"stbl")
+        stsd,stsd_end = child(stbl+8,stbl_end,b"stsd")
+        if b"tmcd" in data[stsd:stsd_end]:
+            break
+    else:
+        raise AssertionError("fixture must contain a timecode track")
+    atoms = {tag:start for tag,start,_ in children(stbl+8,stbl_end)}
+    stts,stsc,stsz,stco = [atoms[tag] for tag in [b"stts",b"stsc",b"stsz",b"stco"]]
+    old_count,old_duration = struct.unpack_from(">II",data,stts+16)
+    assert old_count == 1 and struct.unpack_from(">II",data,stsz+12) == (4,1)
+    count = 2 if kind == "multiple" else 1
+    struct.pack_into(">II",data,stts+16,count,old_duration//2)
+    struct.pack_into(">I",data,stsc+20,count)
+    struct.pack_into(">I",data,stsz+16,count)
+    offset = struct.unpack_from(">I",data,stco+16)[0]
+    payload = bytes(data[offset:offset+4])
+    if count == 2:
+        payload += (2*3600*24).to_bytes(4,"big")
+    struct.pack_into(">I",data,stco+16,len(data)+8)
+    data += struct.pack(">I4s",8+len(payload),b"mdat") + payload
+    unusual.write_bytes(data)
+    before = set(tmp_path.iterdir())
+    with pytest.raises(MediaError,match="时间码"):
+        convert(unusual,Fraction(30),tmp_path)
+    assert set(tmp_path.iterdir()) == before

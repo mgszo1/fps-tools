@@ -1,7 +1,7 @@
 import time
 
 import pytest
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QLabel
 from PySide6.QtTest import QTest
 from PySide6.QtCore import Qt, QCoreApplication, QEvent, QMimeData, QPointF
 from PySide6.QtGui import QDropEvent
@@ -154,3 +154,28 @@ def test_queue_drop_positions_and_keyboard_reordering(app, make_video):
     table.selectRow(1)
     QTest.keyClick(table,Qt.Key.Key_Up,Qt.KeyboardModifier.AltModifier)
     assert window.paths == [files[1],files[0],files[2]]
+
+
+def test_small_window_keeps_settings_readable_and_remove_visible(app, make_video):
+    window = MainWindow()
+    window.resize(900,620)
+    window.show()
+    window.add_files([make_video(frames=24,audio=False)])
+    settle(app,window)
+    window.log.show()
+    window.output_label.setText("/一个很长的项目文件夹/原始素材/剪辑之后的输出文件/最终确认版本")
+    app.processEvents()
+    layout = window.settings_scroll.widget().layout()
+    bottom = -1
+    for i in range(layout.count()):
+        widget = layout.itemAt(i).widget()
+        if widget is None:
+            continue
+        assert widget.y() > bottom
+        bottom = widget.y()+widget.height()-1
+        if isinstance(widget,QLabel):
+            needed = widget.heightForWidth(widget.width()) if widget.hasHeightForWidth() else widget.sizeHint().height()
+            assert widget.height() >= needed
+    assert window.settings_scroll.verticalScrollBar().maximum() > 0
+    assert window.start_button.isVisible()
+    assert window.table.columnViewportPosition(5)+window.table.columnWidth(5) <= window.table.viewport().width()
