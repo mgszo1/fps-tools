@@ -163,3 +163,39 @@ def test_refuses_disguised_truncated_file(make_video, tmp_path):
     src.write_bytes(src.read_bytes()[:-2000])
     with pytest.raises(MediaError):
         convert(src, Fraction(30), tmp_path)
+
+
+def test_scientific_notation_is_rejected_before_fraction_allocation():
+    with pytest.raises(MediaError):
+        parse_fps("1e2")
+
+
+def test_discontinuous_audio_is_rejected(make_video, tmp_path):
+    src = make_video(frames=96,extra=("-af",r"aselect=not(between(t\,1\,2))"))
+    with pytest.raises(MediaError,match="音轨.*(不连续|空档)"):
+        convert(src, Fraction(30), tmp_path)
+
+
+@pytest.mark.parametrize("remove", [1000,4000])
+def test_truncated_mkv_with_zero_header_frame_count_is_rejected(make_video, tmp_path, remove):
+    src = make_video(name="truncated.mkv",frames=96,audio=False)
+    src.write_bytes(src.read_bytes()[:-remove])
+    with pytest.raises(MediaError):
+        convert(src, Fraction(30), tmp_path)
+
+
+@pytest.mark.parametrize("target", [24,30])
+def test_extended_final_frame_is_rejected(make_video, tmp_path, target):
+    src = make_video(name="normal.mkv",frames=96,audio=False)
+    extended=tmp_path/"extended.mkv"
+    with av.open(str(src)) as inp, av.open(str(extended),mode="w") as output:
+        stream=output.add_stream_from_template(inp.streams.video[0])
+        packets=[p for p in inp.demux(video=0) if p.size]
+        end_pts=max(p.pts for p in packets)
+        for packet in packets:
+            if packet.pts == end_pts:
+                packet.duration=1000
+            packet.stream=stream
+            output.mux(packet)
+    with pytest.raises(MediaError):
+        convert(extended,Fraction(target),tmp_path)

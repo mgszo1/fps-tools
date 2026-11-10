@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 import tempfile
 import threading
 from collections.abc import Callable
@@ -27,7 +28,7 @@ NTSC = {"23.976": Fraction(24000,1001), "29.97": Fraction(30000,1001), "59.94": 
 def parse_fps(text: str) -> Fraction:
     try:
         text = text.strip()
-        if len(text) > 40:
+        if len(text) > 40 or not re.fullmatch(r"(?:[0-9]{1,9}(?:\.[0-9]{1,6})?|[0-9]{1,9}/[0-9]{1,9})", text):
             raise ValueError
         value = NTSC[text] if text in NTSC else Fraction(text)
         if not 1 <= value <= 240 or value.denominator > 1_000_000 or value.numerator > 240_000_000:
@@ -112,9 +113,11 @@ def inspect_media(path: Path | str, cancel: threading.Event | None = None,
             count = 0
             first = None
             previous = None
+            last_frame_duration = None
             total = stream.frames or 0
-            tolerance = max(tb * Fraction(11,10), Fraction(1,1_000_000))
+            tolerance = min(max(tb * Fraction(11,10), Fraction(1,1_000_000)), Fraction(49,100)/rate)
             ends: dict[int, Fraction] = {}
+            audio_ends: dict[int, Fraction] = {}
             for packet in container.demux():
                 check_cancel(cancel)
                 if packet.is_corrupt:
@@ -122,6 +125,20 @@ def inspect_media(path: Path | str, cancel: threading.Event | None = None,
                 if packet.size and packet.pts is not None and packet.duration:
                     end = Fraction(packet.pts + packet.duration) * packet.time_base
                     ends[packet.stream.index] = max(ends.get(packet.stream.index, end), end)
+                elif packet.size and packet.stream.type == "audio":
+                    raise MediaError("音轨时间戳不完整，无法保证同步变速。")
+                if packet.stream.type == "audio":
+                    # Container packet durations can include a gap. Actual decoded
+                    # sample count is independent and exposes missing audio time.
+                    for audio_frame in packet.decode():
+                        if audio_frame.pts is None:
+                            raise MediaError("音轨时间戳不完整，无法保证同步变速。")
+                        index = packet.stream.index
+                        begin = Fraction(audio_frame.pts) * audio_frame.time_base
+                        audio_tolerance = max(2*audio_frame.time_base, Fraction(1,audio_frame.sample_rate))
+                        if index in audio_ends and abs(begin-audio_ends[index]) > audio_tolerance:
+                            raise MediaError("音轨时间戳不连续或含空档，无法保证同步变速。")
+                        audio_ends[index] = begin + Fraction(audio_frame.samples,audio_frame.sample_rate)
                 if packet.stream.index != stream.index:
                     continue
                 if packet.size:
@@ -142,6 +159,7 @@ def inspect_media(path: Path | str, cancel: threading.Event | None = None,
                     if (previous is not None and stamp <= previous) or abs(stamp - first - count/rate) > tolerance:
                         raise MediaError("检测到可变帧率或不连续时间戳。当前版本只处理恒定帧率视频。")
                     previous = stamp
+                    last_frame_duration = Fraction(frame.duration or 0) * frame.time_base
                     count += 1
                     if progress and count % 48 == 0:
                         progress("检查视频", min(.99, count/total) if total else 0.)
@@ -149,6 +167,23 @@ def inspect_media(path: Path | str, cancel: threading.Event | None = None,
                 raise MediaError("没有可读取的视频帧。")
             if total and total != count:
                 raise MediaError("实际帧数与文件索引不一致，文件可能不完整。")
+            # Count/rate is the intended duration; compare it with an independently
+            # observed presentation endpoint, including the final frame's hold time.
+            actual_end = previous + last_frame_duration if last_frame_duration else ends.get(stream.index)
+            if actual_end is None or abs(actual_end - first - count/rate) > tolerance:
+                raise MediaError("视频末帧时长异常或无法确认，不属于可完整校验的恒定帧率视频。")
+            actual_duration = actual_end - first
+            if stream.duration and abs(stream.duration*tb - actual_duration) > max(2*tb,tolerance):
+                raise MediaError("视频实际时长与索引不一致，文件可能不完整。")
+            declared = stream.metadata.get("DURATION", "")
+            match = re.fullmatch(r"([0-9]{1,5}):([0-5][0-9]):([0-5][0-9](?:\.[0-9]{1,9})?)",declared)
+            if match:
+                declared_end = int(match[1])*3600 + int(match[2])*60 + Fraction(match[3])
+                if abs(declared_end-actual_end) > max(2*tb,tolerance):
+                    raise MediaError("视频实际时长与声明时长不一致，文件可能被截断。")
+            elif not audio and stream.duration is None and container.duration is not None:
+                if abs(Fraction(container.duration,1_000_000)-actual_end) > max(2*tb,tolerance):
+                    raise MediaError("视频实际时长与容器不一致，文件可能不完整。")
             for s in container.streams.audio:
                 if s.duration and s.start_time is not None:
                     expected_end = (s.start_time + s.duration) * s.time_base
@@ -156,7 +191,7 @@ def inspect_media(path: Path | str, cancel: threading.Event | None = None,
                         raise MediaError("音轨数据不完整，文件可能被截断。")
             if _identity(path) != identity:
                 raise MediaError("检查期间源文件发生变化，请重新添加。")
-            return MediaInfo(path, rate, count, count/rate, first, tb, stream.index, ctx.name,
+            return MediaInfo(path, rate, count, actual_duration, first, tb, stream.index, ctx.name,
                              ctx.width, ctx.height, properties, digest.hexdigest(), extradata, audio, identity)
     except (MediaError, Cancelled):
         raise

@@ -3,7 +3,7 @@ import time
 import pytest
 from PySide6.QtWidgets import QApplication
 from PySide6.QtTest import QTest
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QCoreApplication, QEvent
 
 from fps_tools.gui import MainWindow
 
@@ -11,6 +11,20 @@ from fps_tools.gui import MainWindow
 @pytest.fixture(scope="session")
 def app():
     return QApplication.instance() or QApplication([])
+
+
+@pytest.fixture(autouse=True)
+def clean_windows(app):
+    yield
+    for window in app.topLevelWidgets():
+        if isinstance(window, MainWindow):
+            if window.busy:
+                window.cancel_job()
+                settle(app, window)
+            window.close()
+            window.deleteLater()
+    QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+    app.processEvents()
 
 
 def settle(app, window):
