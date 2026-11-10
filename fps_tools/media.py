@@ -293,7 +293,8 @@ def _retime_video(info: MediaInfo, target: Fraction, destination: Path,
     try:
         with av.open(str(info.path)) as source, av.open(str(destination), "w") as output:
             original = source.streams[info.video_index]
-            video = output.add_stream_from_template(original)
+            video = output.add_stream_from_template(original, opaque=True)
+            video.codec_context.codec_tag = original.codec_context.codec_tag
             video.metadata.update(original.metadata)
             output.metadata.update(source.metadata)
             output.metadata.pop("DURATION", None)

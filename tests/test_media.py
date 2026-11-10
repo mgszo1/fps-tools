@@ -243,3 +243,10 @@ def test_mov_timecode_survives_repeated_conform(make_video, tmp_path, codec):
             assert timecodes[0].metadata["timecode"] == "01:02:03:04"
             assert float(timecodes[0].duration*timecodes[0].time_base) == pytest.approx(float(97/target),abs=.002)
         src = out.path
+
+
+def test_hevc_apple_codec_tag_is_preserved(make_video, tmp_path):
+    src = make_video(frames=24,codec="libx265",extra=("-tag:v","hvc1"))
+    out = convert(src,Fraction(30),tmp_path)
+    with av.open(str(out.path)) as c:
+        assert c.streams.video[0].codec_context.codec_tag == "hvc1"
