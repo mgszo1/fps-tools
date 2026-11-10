@@ -4,11 +4,11 @@ import sys
 import threading
 from pathlib import Path
 
-from PySide6.QtCore import QThread, Signal, Qt, QUrl, QCoreApplication, QEvent
-from PySide6.QtGui import QDesktopServices, QFont, QColor, QIcon
+from PySide6.QtCore import QThread, Signal, Qt, QUrl, QCoreApplication, QEvent, QMimeData
+from PySide6.QtGui import QDesktopServices, QFont, QColor, QIcon, QDrag, QPainter, QPen
 from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QPushButton, QFrame, QComboBox, QTableWidget, QTableWidgetItem, QHeaderView,
-    QFileDialog, QProgressBar, QPlainTextEdit, QSizePolicy)
+    QFileDialog, QProgressBar, QPlainTextEdit, QSizePolicy, QScrollArea, QAbstractItemView)
 
 from . import __version__
 from .media import EXTENSIONS, Cancelled, MediaError, MediaInfo, convert, inspect_media, parse_fps
@@ -37,7 +37,7 @@ QPushButton#quiet { background: transparent; border: none; color: #a2b7aa; paddi
 QComboBox { border: 1px solid #4c6957; border-radius: 9px; padding: 10px; background: #101a14; min-height: 28px; font-size: 23px; }
 QComboBox QAbstractItemView { background: #203328; selection-background-color: #3d654b; font-size: 15px; }
 QComboBox::drop-down { border: none; width: 26px; }
-QComboBox QLineEdit { background: transparent; }
+QComboBox QLineEdit { background: transparent; font-size: 23px; }
 QTableWidget { background: #19231e; border: none; gridline-color: #2b3d32; selection-background-color: #284733; }
 QTableWidget::item { padding: 10px 6px; border-bottom: 1px solid #2a3b30; }
 QHeaderView::section { background: #19231e; color: #8fa99a; border: none; border-bottom: 1px solid #2b3d32; padding: 9px 6px; font-size: 11px; }
@@ -62,6 +62,104 @@ def label(text, name=None, wrap=False):
 
 def seconds(value):
     return f"{float(value):.3f} 秒"
+
+
+class QueueTable(QTableWidget):
+    row_moved = Signal(int, int)
+    remove_requested = Signal(int)
+    files_dropped = Signal(list)
+    MIME = "application/x-fps-tools-row"
+
+    def __init__(self):
+        super().__init__(0, 6)
+        self.editable_queue = True
+        self._drop_row = None
+        self.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.setDragDropMode(QAbstractItemView.DragDropMode.DragDrop)
+        self.setDefaultDropAction(Qt.DropAction.MoveAction)
+        self.setDragDropOverwriteMode(False)
+        self.setAutoScroll(True)
+
+    def startDrag(self, _actions):
+        if not self.editable_queue or self.currentRow() < 0:
+            return
+        mime = QMimeData()
+        mime.setData(self.MIME, str(self.currentRow()).encode("ascii"))
+        drag = QDrag(self)
+        drag.setMimeData(mime)
+        drag.exec(Qt.DropAction.MoveAction)
+
+    def dragEnterEvent(self, event):
+        if not self.editable_queue:
+            event.ignore()
+        elif event.source() is self and event.mimeData().hasFormat(self.MIME):
+            event.acceptProposedAction()
+        elif event.mimeData().hasUrls() and all(u.isLocalFile() for u in event.mimeData().urls()):
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def _insertion_row(self, position):
+        row = self.rowAt(position.y())
+        if row < 0:
+            return self.rowCount()
+        middle = self.rowViewportPosition(row) + self.rowHeight(row) / 2
+        return row + (position.y() >= middle)
+
+    def dragMoveEvent(self, event):
+        self.dragEnterEvent(event)
+        if event.isAccepted() and event.source() is self:
+            self._drop_row = self._insertion_row(event.position().toPoint())
+            self.viewport().update()
+
+    def dragLeaveEvent(self, event):
+        self._drop_row = None
+        self.viewport().update()
+        event.accept()
+
+    def dropEvent(self, event):
+        self._drop_row = None
+        self.viewport().update()
+        if not self.editable_queue:
+            event.ignore()
+            return
+        if event.source() is self and event.mimeData().hasFormat(self.MIME):
+            source = int(bytes(event.mimeData().data(self.MIME)))
+            destination = self._insertion_row(event.position().toPoint())
+            if destination > source:
+                destination -= 1
+            self.row_moved.emit(source, destination)
+            event.acceptProposedAction()
+        elif event.mimeData().hasUrls() and all(u.isLocalFile() for u in event.mimeData().urls()):
+            self.files_dropped.emit([u.toLocalFile() for u in event.mimeData().urls()])
+            event.acceptProposedAction()
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        if self._drop_row is not None:
+            y = (self.rowViewportPosition(self._drop_row) if self._drop_row < self.rowCount()
+                 else self.rowViewportPosition(self.rowCount()-1) + self.rowHeight(self.rowCount()-1))
+            painter = QPainter(self.viewport())
+            painter.setPen(QPen(QColor("#b7f5cf"), 2))
+            painter.drawLine(0, max(1,y), self.viewport().width(), max(1,y))
+            painter.end()
+
+    def keyPressEvent(self, event):
+        if self.editable_queue:
+            row = self.currentRow()
+            if event.key() in {Qt.Key.Key_Delete, Qt.Key.Key_Backspace}:
+                self.remove_requested.emit(row)
+                return
+            if event.modifiers() & Qt.KeyboardModifier.AltModifier:
+                if event.key() in {Qt.Key.Key_Up, Qt.Key.Key_Down}:
+                    self.row_moved.emit(row, row + (-1 if event.key() == Qt.Key.Key_Up else 1))
+                    return
+        super().keyPressEvent(event)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        other_width = sum(self.columnWidth(i) for i in range(1, self.columnCount()))
+        self.setColumnWidth(0, max(130, self.viewport().width() - other_width))
 
 
 class Worker(QThread):
@@ -102,7 +200,7 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle("帧率小工具 · FPS Tools")
         self.resize(1080, 780)
-        self.setMinimumSize(900, 700)
+        self.setMinimumSize(900, 620)
         self.setAcceptDrops(True)
         self.setStyleSheet(STYLE)
         self.paths: list[Path] = []
@@ -116,8 +214,8 @@ class MainWindow(QMainWindow):
         base = QWidget()
         self.setCentralWidget(base)
         root = QVBoxLayout(base)
-        root.setContentsMargins(30, 24, 30, 22)
-        root.setSpacing(18)
+        root.setContentsMargins(24, 20, 24, 18)
+        root.setSpacing(14)
         header = QHBoxLayout()
         header.addWidget(label("▥   FPS TOOLS", "brand"))
         header.addWidget(label(f"v{__version__}", "muted"))
@@ -136,7 +234,7 @@ class MainWindow(QMainWindow):
         drop = QFrame()
         drop.setObjectName("drop")
         dropbox = QVBoxLayout(drop)
-        dropbox.setContentsMargins(18, 20, 18, 20)
+        dropbox.setContentsMargins(18, 14, 18, 14)
         title = label("＋   拖入一个或多个视频", "section")
         title.setAlignment(Qt.AlignmentFlag.AlignCenter)
         dropbox.addWidget(title)
@@ -160,14 +258,18 @@ class MainWindow(QMainWindow):
         self.clear_button.clicked.connect(self.clear_queue)
         qhead.addWidget(self.clear_button)
         qbox.addLayout(qhead)
-        self.table = QTableWidget(0, 5)
-        self.table.setHorizontalHeaderLabels(["文件", "源帧率", "总帧数", "导出时长", "状态"])
+        qbox.addWidget(label("拖动行可排序 · 选中后按 Delete 可移除", "muted", True))
+        self.table = QueueTable()
+        self.table.row_moved.connect(self.move_queue_row)
+        self.table.remove_requested.connect(self.remove_queue_row)
+        self.table.files_dropped.connect(self.add_files)
+        self.table.setHorizontalHeaderLabels(["文件", "源帧率", "总帧数", "原片时长", "状态", "操作"])
         self.table.verticalHeader().hide()
         self.table.setShowGrid(False)
         self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
-        self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-        for col, width in [(1,75),(2,68),(3,100),(4,116)]:
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Fixed)
+        for col, width in [(0,130),(1,62),(2,68),(3,92),(4,82),(5,58)]:
             self.table.setColumnWidth(col,width)
         self.table.verticalHeader().setDefaultSectionSize(48)
         qbox.addWidget(self.table)
@@ -179,10 +281,21 @@ class MainWindow(QMainWindow):
         content.addLayout(left, 1)
         settings = QFrame()
         settings.setObjectName("card")
-        settings.setFixedWidth(270)
-        right = QVBoxLayout(settings)
-        right.setContentsMargins(22, 20, 22, 20)
-        right.setSpacing(10)
+        settings.setFixedWidth(294)
+        settings_box = QVBoxLayout(settings)
+        settings_box.setContentsMargins(16, 16, 16, 16)
+        settings_box.setSpacing(12)
+        self.settings_scroll = QScrollArea()
+        self.settings_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.settings_scroll.setWidgetResizable(True)
+        self.settings_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.settings_scroll.setStyleSheet("QScrollArea, QScrollArea > QWidget > QWidget { background: #19231e; }")
+        settings_body = QWidget()
+        right = QVBoxLayout(settings_body)
+        right.setContentsMargins(4, 4, 10, 4)
+        right.setSpacing(12)
+        self.settings_scroll.setWidget(settings_body)
+        settings_box.addWidget(self.settings_scroll, 1)
         right.addWidget(label("导出设置", "section"))
         right.addWidget(label("目标帧率 / FPS", "muted"))
         self.rate = QComboBox()
@@ -191,6 +304,7 @@ class MainWindow(QMainWindow):
         self.rate.setCurrentText("30")
         self.rate.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
         self.rate.setAccessibleName("目标帧率")
+        self.rate.setFixedHeight(64)
         self.rate.currentTextChanged.connect(self.refresh)
         right.addWidget(self.rate)
         right.addWidget(label("可直接输入 1–240\n支持小数或 30000/1001", "muted", True))
@@ -207,7 +321,7 @@ class MainWindow(QMainWindow):
         right.addStretch()
         right.addWidget(label("保存位置", "muted"))
         self.output_label = label("与原视频相同的文件夹", None, True)
-        self.output_label.setMaximumHeight(58)
+        self.output_label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Minimum)
         right.addWidget(self.output_label)
         self.output_button = QPushButton("更改文件夹…")
         self.output_button.clicked.connect(self.pick_output)
@@ -216,7 +330,10 @@ class MainWindow(QMainWindow):
         self.start_button.setMinimumHeight(50)
         self.start_button.setObjectName("primary")
         self.start_button.clicked.connect(self.start_export)
-        right.addWidget(self.start_button)
+        settings_box.addWidget(self.start_button)
+        # Preserve text/control height; short windows scroll instead of squeezing.
+        for widget in settings_body.findChildren(QLabel):
+            widget.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Minimum)
         content.addWidget(settings)
         root.addLayout(content, 1)
         self.progress = QProgressBar()
@@ -275,6 +392,7 @@ class MainWindow(QMainWindow):
                 item = QTableWidgetItem(text)
                 item.setToolTip(str(path) if col == 0 else text)
                 self.table.setItem(index,col,item)
+            self._add_remove_button(index)
             jobs.append((index,path))
         if jobs:
             self.launch(Worker(jobs,parent=self))
@@ -288,13 +406,51 @@ class MainWindow(QMainWindow):
         self.table.setRowCount(0)
         self.refresh()
 
+    def _add_remove_button(self, row):
+        button = QPushButton("移除")
+        button.setObjectName("quiet")
+        button.setToolTip("从队列移除，原文件保留")
+        button.setAccessibleName(f"移除 {self.paths[row].name}")
+        button.clicked.connect(lambda _checked=False, r=row: self.remove_queue_row(r))
+        self.table.setCellWidget(row, 5, button)
+
+    def _reorder_queue(self, order):
+        paths = self.paths
+        infos = self.infos
+        items = [[self.table.takeItem(row,col) for col in range(5)] for row in range(len(paths))]
+        self.table.setRowCount(0)
+        self.paths = [paths[i] for i in order]
+        self.infos = {row: infos[old] for row,old in enumerate(order) if old in infos}
+        self.table.setRowCount(len(order))
+        for row,old in enumerate(order):
+            for col,item in enumerate(items[old]):
+                self.table.setItem(row,col,item)
+            self._add_remove_button(row)
+        self.refresh()
+
+    def move_queue_row(self, source, destination):
+        if self.busy or source == destination or not (0 <= source < len(self.paths) and 0 <= destination < len(self.paths)):
+            return
+        order = list(range(len(self.paths)))
+        order.insert(destination,order.pop(source))
+        self._reorder_queue(order)
+        self.table.selectRow(destination)
+
+    def remove_queue_row(self, row):
+        if self.busy or not 0 <= row < len(self.paths):
+            return
+        self._reorder_queue([i for i in range(len(self.paths)) if i != row])
+        if self.paths:
+            self.table.selectRow(min(row,len(self.paths)-1))
+        self.status.setText(f"队列已更新 · {len(self.paths)} 个视频 · 原文件保留")
+
     def refresh(self, *_):
         try:
             target = parse_fps(self.rate.currentText())
         except MediaError:
             target = None
         for row, info in self.infos.items():
-            self.table.item(row,3).setText(seconds(info.frame_count/target) if target else "无效帧率")
+            self.table.item(row,3).setText(seconds(info.duration))
         self.empty.setVisible(not self.paths)
         self.queue_title.setText(f"待处理视频 · {len(self.paths)}" if self.paths else "待处理视频")
         count = sum(i.frame_count for i in self.infos.values())
@@ -304,6 +460,10 @@ class MainWindow(QMainWindow):
         self.start_button.setEnabled(bool(self.infos) and target is not None and not self.busy)
         for widget in [self.rate,self.add_button,self.clear_button,self.output_button]:
             widget.setEnabled(not self.busy)
+        self.table.editable_queue = not self.busy
+        self.table.setDragEnabled(not self.busy)
+        for row in range(self.table.rowCount()):
+            self.table.cellWidget(row,5).setEnabled(not self.busy)
         self.cancel_button.setVisible(self.busy)
         self.reveal_button.setVisible(bool(self.outputs) and not self.busy)
 
@@ -316,7 +476,7 @@ class MainWindow(QMainWindow):
             self.status.setText(str(error))
             return
         self.outputs = []
-        jobs = [(i,self.paths[i]) for i in self.infos]
+        jobs = [(i,path) for i,path in enumerate(self.paths) if i in self.infos]
         for i,_ in jobs:
             self.table.item(i,4).setText("等待导出")
         self.launch(Worker(jobs,target,self.output_dir,parent=self))
