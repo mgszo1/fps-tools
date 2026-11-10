@@ -4,8 +4,8 @@ import sys
 import threading
 from pathlib import Path
 
-from PySide6.QtCore import QThread, Signal, Qt, QUrl
-from PySide6.QtGui import QDesktopServices, QFont, QColor
+from PySide6.QtCore import QThread, Signal, Qt, QUrl, QCoreApplication, QEvent
+from PySide6.QtGui import QDesktopServices, QFont, QColor, QIcon
 from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QPushButton, QFrame, QComboBox, QTableWidget, QTableWidgetItem, QHeaderView,
     QFileDialog, QProgressBar, QPlainTextEdit, QSizePolicy)
@@ -415,6 +415,12 @@ def main():
     app.setApplicationName("FPS Tools")
     app.setOrganizationName("fps-tools")
     app.setFont(QFont(".AppleSystemUIFont" if sys.platform == "darwin" else "Microsoft YaHei", 11))
+    resources = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parents[1]))
+    app.setWindowIcon(QIcon(str(resources / "assets/icon.png")))
     window = MainWindow()
     window.show()
-    return app.exec()
+    result = app.exec()
+    window.deleteLater()
+    QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+    app.processEvents()
+    return result
