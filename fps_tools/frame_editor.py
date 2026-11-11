@@ -37,8 +37,9 @@ class FrameEditor(QWidget):
         self.clip=None;self.history=None;self.cache=None;self.thread=None
         self.busy=False;self.cancel=threading.Event();self.dirty=False;self.project_path=None
         self.last_output=None;self._closing=False;self._loading=False;self.position=0
-        self._audio_key=None;self._pending_play=False;self._play_started=0;self._play_offset=0
+        self._audio_key=None;self._pending_play=False;self._play_started=0;self._play_offset=0;self._audio_updated=time.monotonic()
         self.player=QMediaPlayer(self);self.audio_output=QAudioOutput(self);self.player.setAudioOutput(self.audio_output)
+        self.player.positionChanged.connect(self.audio_position_changed)
         self.player.errorOccurred.connect(lambda *_:self.status.setText('声音预览不可用；画面仍可播放，导出不受影响。'))
         self.timer=QTimer(self);self.timer.setInterval(10);self.timer.timeout.connect(self.tick)
         self._build();self._sync()
@@ -319,14 +320,27 @@ class FrameEditor(QWidget):
             self.status.setText('准备声音预览…')
             self._job(lambda cancel,progress:prepare_audio_preview(self.clip.info,self.plan,key[1],path,cancel),done)
         else:self._start_play()
+    def audio_position_changed(self,position):
+        self._audio_updated=time.monotonic()
+
     def _start_play(self):
         if self.position>=self.plan.total-1:self.position=0
-        self._play_offset=self.position/float(self.plan.target_fps);self._play_started=time.monotonic()
+        self._play_offset=self.position/float(self.plan.target_fps);self._play_started=time.monotonic();self._audio_updated=self._play_started
         if self.clip.info.audio and self.audio.currentData()!='mute':
             self.player.setPosition(round(self._play_offset*1000));self.player.play()
         self.timer.start();self.play_button.setText('暂停  ❚❚');self.status.setText('回放编辑结果 · 预览缩影不用于导出')
     def tick(self):
-        seconds=self._play_offset+time.monotonic()-self._play_started
+        now=time.monotonic()
+        seconds=self._play_offset+now-self._play_started
+        if self._audio_key and self.audio.currentData()!='mute' and self.player.error()==QMediaPlayer.Error.NoError:
+            # Audio startup may lag the wall clock; interpolate only one short
+            # position-notification interval, never let that latency accumulate.
+            lag=now-self._audio_updated
+            if lag<1:
+                seconds=self.player.position()/1000
+                if self.player.playbackState()==QMediaPlayer.PlaybackState.PlayingState:
+                    seconds+=min(.04,max(0,lag))
+            else:self.status.setText('声音设备未推进播放；当前回放画面，导出仍按所选声音方式处理。')
         index=int(seconds*float(self.plan.target_fps))
         if index>=self.plan.total:
             if self.loop.isChecked():self.position=0;self._start_play();index=0

@@ -93,3 +93,15 @@ def test_unsupported_import_is_transactional(app,editor,make_video):
     assert editor.clip==original and editor.cache.name==cache
     assert editor.plan.source_frames==6 and editor.source_model.clip==original
     assert original.thumbnail(0).is_file()
+
+
+def test_playback_follows_audio_clock(app,editor,make_video,monkeypatch):
+    from PySide6.QtMultimedia import QMediaPlayer
+    editor.open_video(make_video(frames=48));settle(app,editor)
+    editor._audio_key=(editor.plan,'tempo')
+    editor._play_started=time.monotonic()-1
+    editor._play_offset=0
+    monkeypatch.setattr(editor.player,'position',lambda:500)
+    monkeypatch.setattr(editor.player,'playbackState',lambda:QMediaPlayer.PlaybackState.PlayingState)
+    editor.tick()
+    assert 12<=editor.position<=13  # Audio is at 0.5 s, wall clock is at 1 s.
