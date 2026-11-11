@@ -1,3 +1,3 @@
-from .gui import main
+from .studio import main
 
 raise SystemExit(main())

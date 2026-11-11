@@ -33,7 +33,7 @@ def make_icon():
     assets.mkdir(exist_ok=True)
     img.save(str(assets/"icon.png"))
     if sys.platform == "darwin":
-        iconset=ROOT/"build/FPS Tools.iconset"
+        iconset=ROOT/"build/FPS Tools Studio.iconset"
         iconset.mkdir(parents=True,exist_ok=True)
         for size in (16,32,128,256,512):
             for multiplier in (1,2):
@@ -55,7 +55,7 @@ def main():
     licenses=ROOT/"build/third-party"
     licenses.mkdir(parents=True,exist_ok=True)
     versions={}
-    for name in ["av","PySide6-Essentials","shiboken6","imageio-ffmpeg","PyInstaller"]:
+    for name in ["av","PySide6-Essentials","PySide6-Addons","shiboken6","imageio-ffmpeg","PyInstaller"]:
         dist=importlib.metadata.distribution(name)
         versions[name]=dist.version
         for item in dist.files or []:
@@ -67,21 +67,21 @@ def main():
                     shutil.copyfile(src,dst)
     (licenses/"versions.json").write_text(json.dumps(versions,indent=2),encoding="utf-8")
     args=[sys.executable,"-m","PyInstaller","--noconfirm","--clean","--windowed","--onedir",
-          "--name","FPS Tools","--specpath","build","--paths",str(ROOT),
+          "--name","FPS Tools Studio","--specpath","build","--paths",str(ROOT),
           "--icon",str(icon),"--collect-all","av","--collect-data","imageio_ffmpeg",
           "--add-data",f"{ROOT/'assets'}{os.pathsep}assets",
           "--add-data",f"{ROOT/'licenses'}{os.pathsep}licenses",
           "--add-data",f"{licenses}{os.pathsep}third-party",
           "--add-data",f"{ROOT/'THIRD_PARTY_NOTICES.md'}{os.pathsep}.",
           "--exclude-module","pytest","--exclude-module","numpy","--exclude-module","tkinter",
-          "--osx-bundle-identifier","com.mgszo1.fpstools","scripts/launch.py"]
+          "--osx-bundle-identifier","com.mgszo1.fpstools.studio","scripts/launch.py"]
     subprocess.run(args,check=True)
     if sys.platform=="darwin":
-        app=ROOT/"dist/FPS Tools.app"
-        exe=app/"Contents/MacOS/FPS Tools"
+        app=ROOT/"dist/FPS Tools Studio.app"
+        exe=app/"Contents/MacOS/FPS Tools Studio"
     else:
-        app=ROOT/"dist/FPS Tools"
-        exe=app/"FPS Tools.exe"
+        app=ROOT/"dist/FPS Tools Studio"
+        exe=app/"FPS Tools Studio.exe"
     report=ROOT/"dist/smoke-report.json"
     env=os.environ.copy()
     env["PATH"]="/usr/bin:/bin" if sys.platform=="darwin" else str(Path(os.environ["SystemRoot"])/"System32")
@@ -95,7 +95,7 @@ def main():
     print(json.dumps(data,ensure_ascii=False))
     arch="arm64" if platform.machine().lower() in {"arm64","aarch64"} else "x64"
     system="macOS" if sys.platform=="darwin" else "Windows"
-    archive=ROOT/f"dist/FPS-Tools-{__version__}-{system}-{arch}.zip"
+    archive=ROOT/f"dist/FPS-Tools-Studio-{__version__}-{system}-{arch}.zip"
     if sys.platform=="darwin":
         subprocess.run(["ditto","-c","-k","--sequesterRsrc","--keepParent",str(app),str(archive)],check=True)
     else:

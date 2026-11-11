@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "fps-tools"
-version = "1.1.0"
+version = "2.0.0"
 description = "Verified video frame-rate conform with pitch-preserving audio"
 requires-python = ">=3.11"
 dependencies = ["PySide6-Essentials==6.12.0", "PySide6-Addons==6.12.0", "av==18.1.0", "imageio-ffmpeg==0.8.1"]
@@ -13,7 +13,7 @@ dependencies = ["PySide6-Essentials==6.12.0", "PySide6-Addons==6.12.0", "av==18.
 dev = ["pytest==9.2.0", "numpy==2.4.6", "pyinstaller==6.22.3"]
 
 [project.gui-scripts]
-fps-tools = "fps_tools.gui:main"
+fps-tools = "fps_tools.studio:main"
 
 [tool.setuptools.packages.find]
 include = ["fps_tools*"]
