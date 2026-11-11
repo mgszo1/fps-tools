@@ -77,3 +77,19 @@ def test_close_cancels_worker(app,make_video):
     settle(app,w)
     assert not w.isVisible() and w.cache is None
     w.deleteLater();QCoreApplication.sendPostedEvents(None,QEvent.Type.DeferredDelete)
+
+
+def test_output_seek_changes_edit_target(app,editor,make_video):
+    editor.open_video(make_video(frames=6,audio=False));settle(app,editor)
+    editor.output_view.clicked.emit(editor.output_model.index(4))
+    editor.edit_selected('delete')
+    assert editor.plan.repeats==(1,1,1,1,0,1)
+
+
+def test_unsupported_import_is_transactional(app,editor,make_video):
+    editor.open_video(make_video('first.mp4',frames=6,audio=False));settle(app,editor)
+    original=editor.clip;cache=editor.cache.name
+    editor.open_video(make_video('300.mp4',fps='300',frames=12,audio=False));settle(app,editor)
+    assert editor.clip==original and editor.cache.name==cache
+    assert editor.plan.source_frames==6 and editor.source_model.clip==original
+    assert original.thumbnail(0).is_file()

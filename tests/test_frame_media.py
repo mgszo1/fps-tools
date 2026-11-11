@@ -44,7 +44,9 @@ def test_cancel_source_change_and_empty(make_video,tmp_path):
     event=threading.Event();event.set()
     with pytest.raises(Cancelled): export_frames(info,plan,ExportSettings(),tmp_path,cancel=event)
     with pytest.raises(MediaError): export_frames(info,plan.set_counts(range(5),0),ExportSettings(),tmp_path)
-    info.path.touch()
+    import os
+    stat=info.path.stat()
+    os.utime(info.path,ns=(stat.st_atime_ns,stat.st_mtime_ns+2_000_000_000))
     with pytest.raises(MediaError,match='变化'): export_frames(info,plan,ExportSettings(),tmp_path)
     assert not list(tmp_path.glob('.fps-edit-*'))
 
@@ -66,11 +68,12 @@ def test_ten_bit_prores_and_rotation(make_video,tmp_path,ffmpeg):
     import subprocess
     original=make_video(frames=6,audio=False)
     rotated=tmp_path/'rotated.mp4'
-    subprocess.run([ffmpeg,'-y','-i',str(original),'-c','copy','-metadata:s:v:0','rotate=90',str(rotated)],check=True,capture_output=True)
+    subprocess.run([ffmpeg,'-y','-display_rotation:v:0','90','-i',str(original),'-c','copy',str(rotated)],check=True,capture_output=True)
     info=inspect_media(rotated)
     plan=FramePlan.original(6,F(24))
     output=export_frames(info,plan,ExportSettings('prores'),tmp_path)
     with av.open(str(rotated)) as c: rotation=next(c.decode(video=0)).rotation
+    assert rotation==90
     with av.open(str(output.path)) as c:
         frame=next(c.decode(video=0))
         assert frame.rotation==rotation
@@ -88,3 +91,41 @@ def test_mid_export_cancel_cleanup(make_video,tmp_path):
     with pytest.raises(Cancelled):
         export_frames(info,FramePlan.original(12,F(24)),ExportSettings(),tmp_path,event,progress)
     assert not list(tmp_path.glob('*edited*')) and not list(tmp_path.glob('.fps-edit-*'))
+
+@pytest.mark.parametrize('codec',['h264','prores'])
+def test_orientation_with_audio(make_video,tmp_path,ffmpeg,codec):
+    import subprocess
+    original=make_video(frames=6)
+    rotated=tmp_path/'audio-rotated.mp4'
+    subprocess.run([ffmpeg,'-y','-display_rotation:v:0','90','-i',str(original),'-c','copy',str(rotated)],check=True,capture_output=True)
+    # FFmpeg 9 no longer creates this side data via the old rotate metadata tag.
+    with av.open(str(original)) as source,av.open(str(rotated),'w') as out:
+        mapping={stream.index:out.add_stream_from_template(stream,opaque=True) for stream in source.streams}
+        mapping[source.streams.video[0].index].set_display_rotation(90)
+        for packet in source.demux():
+            if packet.dts is not None:
+                packet.stream=mapping[packet.stream.index];out.mux(packet)
+    info=inspect_media(rotated)
+    result=export_frames(info,FramePlan.original(6,F(24)),ExportSettings(codec),tmp_path)
+    with av.open(str(rotated)) as c: expected=next(c.decode(video=0)).rotation
+    assert expected==90
+    with av.open(str(result.path)) as c: assert next(c.decode(video=0)).rotation==expected
+
+
+def test_preview_respects_anamorphic_geometry(make_video,tmp_path):
+    from PySide6.QtGui import QImage
+    info=prepare_clip(make_video(frames=3,audio=False,extra=('-vf','setsar=2/1')),tmp_path/'anamorphic')
+    img=QImage(str(info.preview(0)))
+    assert abs(img.width()/img.height()-320/90)<.05
+
+@pytest.mark.parametrize('codec',['h264','prores'])
+def test_rgb_conversion_has_yuv_matrix(tmp_path,ffmpeg,codec):
+    import subprocess
+    path=tmp_path/'rgb.mp4'
+    subprocess.run([ffmpeg,'-y','-f','lavfi','-i','testsrc=size=160x90:rate=24','-frames:v','6','-c:v','libx264rgb','-crf','0',str(path)],check=True,capture_output=True)
+    info=inspect_media(path);assert info.properties[7]==0
+    output=export_frames(info,FramePlan.original(6,F(24)),ExportSettings(codec),tmp_path)
+    with av.open(str(output.path)) as c:
+        f=next(c.decode(video=0));assert f.colorspace==1
+    with av.open(str(path)) as c: original=next(c.decode(video=0)).to_ndarray(format='rgb24').astype(float)
+    assert np.mean(abs(f.to_ndarray(format='rgb24').astype(float)-original))<15

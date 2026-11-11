@@ -8,6 +8,7 @@ import struct
 import tempfile
 
 import av
+from av.video.reformatter import Colorspace
 from PySide6.QtGui import QImage, QTransform
 from .media import MediaInfo, inspect_media, _identity, _tempo_filters
 from .frame_plan import FramePlan
@@ -71,8 +72,10 @@ def prepare_clip(path, cache_dir, cancel=None, progress=None):
             stream=container.streams.video[0];stream.thread_type='AUTO'
             for i,frame in enumerate(container.decode(stream)):
                 check_cancel(cancel)
-                scale=min(1,640/max(frame.width,frame.height))
-                rgb=frame.reformat(width=max(1,int(frame.width*scale)),height=max(1,int(frame.height*scale)),format='rgb24')
+                sar=float(stream.sample_aspect_ratio or 1)
+                width=frame.width*sar
+                scale=min(1,640/max(width,frame.height))
+                rgb=frame.reformat(width=max(1,round(width*scale)),height=max(1,round(frame.height*scale)),format='rgb24')
                 img=QImage(bytes(rgb.planes[0]),rgb.width,rgb.height,rgb.planes[0].line_size,QImage.Format.Format_RGB888).copy()
                 if frame.rotation: img=img.transformed(QTransform().rotate(-frame.rotation))
                 if not img.save(str(clip.preview(i)),'JPEG',92): raise MediaError('预览缓存写入失败。')
@@ -136,6 +139,8 @@ def export_frames(info, plan, settings, directory, cancel=None, progress=None):
             else: ctx.options={'profile':'3'}
             for field,value in zip(('color_range','color_primaries','color_trc','colorspace'),info.properties[4:8]):
                 setattr(ctx,field,value)
+            rgb_source=av.VideoFormat(info.properties[3]).is_rgb
+            if rgb_source: ctx.colorspace=1;ctx.color_range=1
             if src.sample_aspect_ratio: ctx.sample_aspect_ratio=src.sample_aspect_ratio
             index=0;seen=0
             for i,frame in enumerate(source.decode(src)):
@@ -147,7 +152,11 @@ def export_frames(info, plan, settings, directory, cancel=None, progress=None):
                 seen+=1
                 for _ in range(plan.repeats[i]):
                     check_cancel(cancel)
-                    converted=frame.reformat(format=stream.pix_fmt)
+                    converted=frame.reformat(format=stream.pix_fmt,
+                        dst_colorspace=Colorspace.ITU709 if rgb_source else None,
+                        src_color_range=2 if rgb_source else None,
+                        dst_color_range=1 if rgb_source else None)
+                    if rgb_source: converted.colorspace=1;converted.color_range=1
                     converted.pts=index;converted.time_base=ctx.time_base
                     converted.pict_type=0
                     for packet in stream.encode(converted): out.mux(packet)

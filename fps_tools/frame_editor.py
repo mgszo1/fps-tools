@@ -6,7 +6,7 @@ import tempfile
 import threading
 import time
 
-from PySide6.QtCore import Qt, QThread, Signal, QTimer, QUrl, QItemSelectionModel
+from PySide6.QtCore import Qt, QThread, Signal, QTimer, QUrl, QItemSelectionModel, QSignalBlocker
 from PySide6.QtGui import QKeySequence, QShortcut, QDesktopServices
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PySide6.QtWidgets import (QWidget,QVBoxLayout,QHBoxLayout,QLabel,QPushButton,QComboBox,
@@ -190,16 +190,18 @@ class FrameEditor(QWidget):
             clip=prepare_clip(path,Path(new_cache.name),cancel,progress)
             if project and (clip.info.packet_hash!=project.fingerprint or clip.info.frame_count!=project.plan.source_frames or clip.info.fps!=project.plan.source_fps):
                 raise MediaError('工程引用的原片不匹配，未载入。')
-            return clip
-        def done(clip):
+            incoming_plan=project.plan if project else FramePlan.original(clip.info.frame_count,clip.info.fps)
+            incoming_settings=ExportSettings(**project.settings) if project else ExportSettings()
+            return clip,incoming_plan,incoming_settings
+        def done(result):
+            clip,incoming_plan,settings=result
             self.player.stop();self.player.setSource(QUrl());self._audio_key=None
             if self.cache:self.cache.cleanup()
             self.cache=new_cache;self.clip=clip;self._import_cache=None
-            self.history=FrameHistory(project.plan if project else FramePlan.original(clip.info.frame_count,clip.info.fps))
+            self.history=FrameHistory(incoming_plan)
             self.project_path=Path(project_path) if project_path else None
             self._loading=True
             self.rate.setCurrentText(str(self.plan.target_fps));self.keep.setChecked(self.plan.keep_duration)
-            settings=ExportSettings(**project.settings) if project else ExportSettings()
             self.codec.setCurrentIndex(self.codec.findData(settings.codec));self.bitrate.setValue(settings.bitrate_mbps);self.audio.setCurrentIndex(self.audio.findData(settings.audio_mode))
             self._loading=False;self.dirty=False;self.position=0
             self.file_label.setText(f'{clip.info.path.name}   ·   {clip.info.width} × {clip.info.height}   ·   {clip.info.fps} fps')
@@ -329,15 +331,18 @@ class FrameEditor(QWidget):
         if index>=self.plan.total:
             if self.loop.isChecked():self.position=0;self._start_play();index=0
             else:self.pause();index=self.plan.total-1
-        if index!=self.position:self.show_output(index)
-    def show_output(self,index):
+        if index!=self.position:self.show_output(index,True)
+    def show_output(self,index,sync_selection=False):
         if not self.plan or not self.plan.total:
             self.frame_label.setText('结果为空，请恢复至少一帧。');return
         self.position=max(0,min(index,self.plan.total-1));source=self.plan.source_at(self.position)
+        if sync_selection:
+            with QSignalBlocker(self.source_view.selectionModel()):
+                self.source_view.setCurrentIndex(self.source_model.index(source))
         self.preview.show_image(self.clip.preview(source));self.seek.setValue(self.position)
         self.frame_label.setText(f'结果 {self.position+1} / {self.plan.total} 帧  ←  原片 {source+1} 帧   ·   {self.position/float(self.plan.target_fps):.3f} 秒')
         idx=self.output_model.index(self.position);self.output_view.setCurrentIndex(idx);self.output_view.scrollTo(idx)
-    def seek_to(self,index):self.pause();self.show_output(index)
+    def seek_to(self,index):self.pause();self.show_output(index,True)
     def step(self,direction):
         if not self.busy and self.plan:self.seek_to(self.position+direction)
 

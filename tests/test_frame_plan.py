@@ -42,3 +42,10 @@ def test_project_roundtrip_validation(make_video,tmp_path):
     obj=json.loads(dest.read_text()); obj['repeats'][0]=True
     dest.write_text(json.dumps(obj))
     with pytest.raises(MediaError): load_project(dest)
+
+@pytest.mark.parametrize('key,value',[('source_fps',24),('target_fps',None),('target_fps',{}),('source_fps',[])])
+def test_malformed_project_rates_are_rejected(make_video,tmp_path,key,value):
+    info=inspect_media(make_video(frames=2,audio=False));dest=tmp_path/'bad.fpsedit'
+    save_project(dest,info,FramePlan.original(2,F(24)),{})
+    data=json.loads(dest.read_text());data[key]=value;dest.write_text(json.dumps(data))
+    with pytest.raises(MediaError):load_project(dest)

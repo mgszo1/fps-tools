@@ -138,6 +138,7 @@ def load_project(path):
         if obj['version']!=1 or not isinstance(obj['source'],str): raise ValueError()
         fp=obj['fingerprint']
         if not isinstance(fp,str) or len(fp)!=64 or any(c not in '0123456789abcdef' for c in fp): raise ValueError()
+        if not isinstance(obj['source_fps'],str) or not isinstance(obj['target_fps'],str): raise ValueError()
         plan=FramePlan(obj['source_frames'],parse_fps(obj['source_fps']),parse_fps(obj['target_fps']),
                        tuple(obj['repeats']),obj['keep_duration'])
         if not isinstance(obj['settings'],dict): raise ValueError()
