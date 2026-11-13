@@ -126,9 +126,11 @@ def inspect_media(path: Path | str, cancel: threading.Event | None = None,
             total = stream.frames or 0
             tolerance = min(max(tb * Fraction(11,10), Fraction(1,1_000_000)), Fraction(49,100)/rate)
             ends: dict[int, Fraction] = {}
-            audio_ends: dict[int, Fraction] = {}
             timecode_span = None
-            for packet in container.demux():
+            # Audio timing is best-effort: inspect only video/timecode packets.
+            # FFmpeg handles audio decoding during export, without rejecting files
+            # merely for gaps, missing packet timestamps, or duration metadata.
+            for packet in container.demux([stream, *extras]):
                 check_cancel(cancel)
                 if packet.is_corrupt:
                     raise MediaError("检测到损坏或不完整的数据包，无法保证完整导出。")
@@ -141,20 +143,6 @@ def inspect_media(path: Path | str, cancel: threading.Event | None = None,
                 if packet.size and packet.pts is not None and packet.duration:
                     end = Fraction(packet.pts + packet.duration) * packet.time_base
                     ends[packet.stream.index] = max(ends.get(packet.stream.index, end), end)
-                elif packet.size and packet.stream.type == "audio":
-                    raise MediaError("音轨时间戳不完整，无法保证同步变速。")
-                if packet.stream.type == "audio":
-                    # Container packet durations can include a gap. Actual decoded
-                    # sample count is independent and exposes missing audio time.
-                    for audio_frame in packet.decode():
-                        if audio_frame.pts is None:
-                            raise MediaError("音轨时间戳不完整，无法保证同步变速。")
-                        index = packet.stream.index
-                        begin = Fraction(audio_frame.pts) * audio_frame.time_base
-                        audio_tolerance = max(2*audio_frame.time_base, Fraction(1,audio_frame.sample_rate))
-                        if index in audio_ends and abs(begin-audio_ends[index]) > audio_tolerance:
-                            raise MediaError("音轨时间戳不连续或含空档，无法保证同步变速。")
-                        audio_ends[index] = begin + Fraction(audio_frame.samples,audio_frame.sample_rate)
                 if packet.stream.index != stream.index:
                     continue
                 if packet.size:
@@ -205,11 +193,6 @@ def inspect_media(path: Path | str, cancel: threading.Event | None = None,
             elif not audio and stream.duration is None and container.duration is not None:
                 if abs(Fraction(container.duration,1_000_000)-actual_end) > max(2*tb,tolerance):
                     raise MediaError("视频实际时长与容器不一致，文件可能不完整。")
-            for s in container.streams.audio:
-                if s.duration and s.start_time is not None:
-                    expected_end = (s.start_time + s.duration) * s.time_base
-                    if ends.get(s.index, Fraction(0)) + 2*s.time_base < expected_end:
-                        raise MediaError("音轨数据不完整，文件可能被截断。")
             if _identity(path) != identity:
                 raise MediaError("检查期间源文件发生变化，请重新添加。")
             return MediaInfo(path, rate, count, actual_duration, first, tb, stream.index, ctx.name,
@@ -249,7 +232,8 @@ def _audio_options(info: MediaInfo, target: Fraction) -> list[str]:
         delay = max(Fraction(0), audio.start - info.start) / speed
         trim = max(Fraction(0), info.start - audio.start)
         if delay >= duration:
-            raise MediaError("音轨起点位于视频结束之后，无法自动对齐。")
+            # An unusable audio origin must not block otherwise valid video.
+            delay = Fraction(0)
         filters = (f"asetpts=PTS-STARTPTS,atrim=start={float(trim):.15g},asetpts=PTS-STARTPTS,"
                    f"{_tempo_filters(speed)},apad,atrim=duration={float(duration-delay):.15g},"
                    f"asetpts=PTS+{float(delay):.15g}/TB")
@@ -347,7 +331,6 @@ def convert(source: Path | str, target: Fraction, directory: Path | str,
     if not directory.is_dir():
         raise MediaError("输出文件夹不存在。")
     duration = info.frame_count/target
-    args = _audio_options(info, target)
     check_cancel(cancel)
     fd, name = tempfile.mkstemp(prefix=".fps-tools-", suffix=source.suffix, dir=directory)
     os.close(fd)
@@ -375,6 +358,7 @@ def convert(source: Path | str, target: Fraction, directory: Path | str,
                        "-i", str(source), "-map", "0:v:0"]
                 for audio in info.audio:
                     cmd += ["-map", f"1:{audio.index}"]
+                args = _audio_options(info, target)
                 cmd += ["-map_metadata", "1", "-map_metadata:s:v:0", "0:s:v:0", "-map_chapters", "-1",
                         "-c:v", "copy", "-r:v", str(target), "-avoid_negative_ts", "disabled", *args]
                 if source.suffix.lower() in {".mp4", ".mov", ".m4v"}:

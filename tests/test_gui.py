@@ -179,3 +179,18 @@ def test_small_window_keeps_settings_readable_and_remove_visible(app, make_video
     assert window.settings_scroll.verticalScrollBar().maximum() > 0
     assert window.start_button.isVisible()
     assert window.table.columnViewportPosition(5)+window.table.columnWidth(5) <= window.table.viewport().width()
+
+
+def test_gui_imports_and_exports_rounded_audio(app, make_rounded_audio):
+    src = make_rounded_audio()
+    window = MainWindow()
+    window.add_files([src])
+    settle(app, window)
+    assert window.start_button.isEnabled()
+    assert window.infos[0].frame_count == 152
+    window.rate.setEditText("24")
+    window.start_export()
+    settle(app, window)
+    assert len(window.outputs) == 1
+    assert window.outputs[0].exists()
+    assert "通过" in window.table.item(0,4).text()

@@ -160,7 +160,7 @@ def test_extreme_targets_keep_all_frames(make_video, tmp_path, target):
 
 
 def test_refuses_disguised_truncated_file(make_video, tmp_path):
-    src = make_video(frames=48, extra=("-movflags","+faststart"))
+    src = make_video(frames=48, audio=False, extra=("-movflags","+faststart"))
     src.write_bytes(src.read_bytes()[:-2000])
     with pytest.raises(MediaError):
         convert(src, Fraction(30), tmp_path)
@@ -171,10 +171,13 @@ def test_scientific_notation_is_rejected_before_fraction_allocation():
         parse_fps("1e2")
 
 
-def test_discontinuous_audio_is_rejected(make_video, tmp_path):
+def test_audio_gaps_do_not_block_video_export(make_video, tmp_path):
     src = make_video(frames=96,extra=("-af",r"aselect=not(between(t\,1\,2))"))
-    with pytest.raises(MediaError,match="音轨.*(不连续|空档)"):
-        convert(src, Fraction(30), tmp_path)
+    result = convert(src, Fraction(30), tmp_path)
+    checked = inspect_media(result.path)
+    assert checked.frame_count == 96 and checked.fps == 30
+    assert checked.packet_hash == packet_hash(src)
+    assert len(checked.audio) == 1
 
 
 @pytest.mark.parametrize("remove", [1000,4000])
@@ -297,3 +300,75 @@ def test_unsupported_timecode_maps_are_not_silently_replaced(make_video, tmp_pat
     with pytest.raises(MediaError,match="时间码"):
         convert(unusual,Fraction(30),tmp_path)
     assert set(tmp_path.iterdir()) == before
+
+
+@pytest.mark.parametrize("ext,sample_rate,rounding", [
+    ("mp4",48000,-1), ("mov",48000,-2), ("m4v",44100,-1), ("mp4",48000,1),
+])
+def test_rounded_aac_timing_keeps_all_video_and_audio(make_rounded_audio, tmp_path,
+                                                     ext, sample_rate, rounding):
+    src = make_rounded_audio(name="rounded."+ext, sample_rate=sample_rate, rounding=rounding)
+    original = src.read_bytes()
+    info = inspect_media(src)
+    assert info.frame_count == 152 and info.fps == 30
+    assert info.audio[0].sample_rate == sample_rate
+    for target in [Fraction(24), Fraction(60), Fraction(30)]:
+        result = convert(src, target, tmp_path)
+        checked = inspect_media(result.path)
+        assert checked.frame_count == 152 and checked.fps == target
+        assert checked.packet_hash == packet_hash(src)
+        assert len(checked.audio) == 1
+        with av.open(str(result.path)) as container:
+            sound = list(container.decode(audio=0))
+            assert sound
+            if target != 30:
+                assert sum(f.samples / f.sample_rate for f in sound) == pytest.approx(
+                    float(Fraction(152)/target), abs=.05)
+        if target == 30:
+            assert result.path.read_bytes() == original
+    assert src.read_bytes() == original
+
+
+@pytest.mark.parametrize("rounding", [1024, -256])
+def test_audio_timestamp_jumps_do_not_block_video(make_rounded_audio, tmp_path, rounding):
+    src = make_rounded_audio(rounding=rounding)
+    result = convert(src, Fraction(24), tmp_path)
+    checked = inspect_media(result.path)
+    assert checked.frame_count == 152 and checked.fps == 24
+    assert checked.packet_hash == packet_hash(src)
+    assert len(checked.audio) == 1
+
+
+def test_audio_declared_duration_does_not_block_video(make_rounded_audio, tmp_path):
+    src = make_rounded_audio(declared_extra_ms=1000)
+    result = convert(src, Fraction(24), tmp_path)
+    checked = inspect_media(result.path)
+    assert checked.frame_count == 152 and checked.fps == 24
+    assert checked.packet_hash == packet_hash(src)
+    assert len(checked.audio) == 1
+
+
+def test_missing_audio_tail_does_not_reject_complete_video(make_video, tmp_path):
+    src = make_video(frames=48, extra=("-movflags","+faststart"))
+    video_hash = packet_hash(src)
+    src.write_bytes(src.read_bytes()[:-2000])
+    result = convert(src, Fraction(30), tmp_path)
+    checked = inspect_media(result.path)
+    assert checked.frame_count == 48 and checked.fps == 30
+    assert checked.packet_hash == video_hash
+    assert len(checked.audio) == 1
+
+
+@pytest.mark.parametrize("target", [24,30])
+def test_audio_start_after_video_does_not_prevent_export(make_video, ffmpeg, tmp_path, target):
+    video = make_video(frames=48, audio=False)
+    src = tmp_path/"late-audio.mp4"
+    subprocess.run([ffmpeg,"-v","error","-i",str(video),"-itsoffset","10",
+                    "-f","lavfi","-i","sine=frequency=440:sample_rate=48000:duration=1",
+                    "-map","0:v","-map","1:a","-c:v","copy","-c:a","aac",str(src)],
+                   check=True,capture_output=True)
+    result = convert(src, Fraction(target), tmp_path)
+    checked = inspect_media(result.path)
+    assert checked.frame_count == 48 and checked.fps == target
+    assert checked.packet_hash == packet_hash(video)
+    assert len(checked.audio) == 1
